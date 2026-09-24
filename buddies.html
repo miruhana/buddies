@@ -138,6 +138,12 @@ textarea.inp{min-height:130px;line-height:1.6;resize:vertical}
 .hint{font-size:.85rem;color:var(--ink2);margin-top:6px}
 .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
 .chip{min-height:52px;border-radius:26px;border:2px solid var(--soft);background:#fff;padding:6px 16px;font-size:.9rem}
+/* 会話のやりとり（自分は右、相棒は左） */
+.chatlog{display:flex;flex-direction:column;gap:10px;margin-top:14px}
+.cmsg{max-width:88%;padding:10px 14px;border-radius:18px;font-size:.95rem;line-height:1.6;overflow-wrap:anywhere}
+.cmsg.me{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:6px}
+.cmsg.ai{align-self:flex-start;background:var(--card);border:2px solid var(--soft);border-bottom-left-radius:6px}
+.cmsg.ai b{display:block;font-family:var(--disp);font-size:.85rem;color:var(--accent)}
 .seg{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:8px}
 .seg button{min-height:64px;border-radius:14px;border:2.5px solid var(--soft);background:#fff;font-family:var(--disp);font-weight:700;line-height:1.25;padding:6px}
 .seg button[aria-pressed="true"]{border-color:var(--accent);background:var(--accent);color:#fff}
@@ -1086,6 +1092,49 @@ S.subs = S.subs || []; S.history = S.history || [];
 if (!S.settings.device) { const d = detectDevice(); S.settings.device = d || 'iphone'; S.settings.detected = !!d; }
 
 /* ---- AI（Claude）につなぐ ---- */
+/* Claudeの外で使うAIの中継先（Cloudflare Workers AI・無料枠）。空にするとAIは使いません */
+const AI_ENDPOINT = 'https://buddies-ai.buddies-ai.workers.dev';
+/* Claudeの sample と同じ使い方ができる形で、中継先を呼ぶ */
+function workerSample() {
+  const call = async (input, opts, json) => {
+    const o = opts || {};
+    const messages = typeof input === 'string' ? [{ role: 'user', content: input }] : input.map((t) => ({ role: t.role, content: String(t.content) }));
+    const image = o.images && o.images[0] ? await shrinkImage(o.images[0]).catch(() => { throw { code: 'image_rejected' }; }) : null;
+    let res;
+    try {
+      res = await fetch(AI_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages, image, json }), signal: o.signal });
+    } catch (e) { throw { code: e && e.name === 'AbortError' ? 'cancelled' : 'network' }; }
+    const d = await res.json().catch(() => ({}));
+    if (res.status === 429) throw { code: 'rate_limited', why: d.code };
+    if (!res.ok || typeof d.text !== 'string') throw { code: d.code || 'ai_error' };
+    return d.text;
+  };
+  const fn = async (input, opts) => ({ text: await call(input, opts, false), truncated: false });
+  fn.json = async (input, opts) => {
+    const t = await call(input, opts, true);
+    try { return JSON.parse(t); } catch (e) {}
+    const m = t.match(/\{[\s\S]*\}/); // 前後に余計な文が付いたとき
+    if (m) try { return JSON.parse(m[0]); } catch (e) {}
+    throw { code: 'invalid_json' };
+  };
+  fn.limits = async () => ({ images: true });
+  return fn;
+}
+/* 写真は長い辺1024pxのJPEGに小さくしてから送る（速く、通信量も少なく） */
+function shrinkImage(file) {
+  return new Promise((ok, ng) => {
+    const url = URL.createObjectURL(file), img = new Image();
+    img.onload = () => {
+      const k = Math.min(1, 1024 / Math.max(img.naturalWidth, img.naturalHeight));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.naturalWidth * k); c.height = Math.round(img.naturalHeight * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url); ok(c.toDataURL('image/jpeg', 0.82));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); ng(new Error('image')); };
+    img.src = url;
+  });
+}
 let sampleFn = null, imgOK = false, aiReady = false;
 setTimeout(async () => {
   try {
@@ -1094,6 +1143,8 @@ setTimeout(async () => {
       if (sampleFn) { const lim = await sampleFn.limits().catch(() => null); imgOK = !!(lim && lim.images); }
     }
   } catch (e) { sampleFn = null; }
+  // Claudeの外（GitHubのページなど）では、Cloudflareの中継（無料のAI）を使う
+  if (!sampleFn && AI_ENDPOINT) { sampleFn = workerSample(); imgOK = true; }
   aiReady = true;
   if (['photo', 'ask'].includes(cur().v)) render();
 }, 0);
@@ -1427,7 +1478,7 @@ V.subUnknown = (p) => {
 
 /* --- 話しかける（AIに相談） --- */
 V.ask = (p) => {
-  if (p.busy) return `${topbar('相談')}${hero('think', '考えています。<br>少し待っていてくださいね。')}<div class="think"><i></i><i></i><i></i>考えています</div><div class="stack"><button class="btn" data-act="askstop">やめる</button></div>`;
+  if (p.busy) return `${topbar('相談')}${hero('think', '考えています。<br>少し待っていてくださいね。')}${p.q ? `<div class="chatlog"><div class="cmsg me">${esc(p.q)}</div></div>` : ''}<div class="think"><i></i><i></i><i></i>考えています</div><div class="stack"><button class="btn" data-act="askstop">やめる</button></div>`;
   if (p.res) return askResult(p);
   const noAI = aiReady && !sampleFn;
   return `${topbar('話しかける')}
@@ -1442,22 +1493,39 @@ V.ask = (p) => {
 function askResult(p) {
   const r = p.res;
   const local = p.local ? `<div class="card"><h3>この案内も使えます</h3><button class="btn" style="width:100%" data-act="topic" data-k="${p.local}">${esc({ SUB: 'サブスクのこと', SCAM: 'あやしい連絡チェック', TV: 'テレビで見る', TRIPS: '困ったときのQ&A', SIGN: 'サブスクに申し込む', LINE: 'LINEの使い方' }[p.local] || GUIDES[p.local].title)}</button></div>` : '';
+  // これまでの会話（いちばん新しい答えは、下の相棒のふきだしに出す）
+  const chat = p.chat || [];
+  const past = chat.slice(0, -1).map((c) => `<div class="cmsg me">${esc(c.q)}</div><div class="cmsg ai"><b>${esc(C().name)}</b>${esc(c.res.conclusion || c.res.what || '')}${(c.res.explain || []).length ? `<br>${esc(c.res.explain.join(''))}` : ''}</div>`).join('');
+  const last = chat.length ? chat[chat.length - 1].q : '';
+  const log = past || last ? `<div class="chatlog">${past}${last ? `<div class="cmsg me">${esc(last)}</div>` : ''}</div>` : '';
+  const more = sampleFn ? followBox() : '';
   if (r.kind === 'danger') {
-    return `${topbar('相談の答え')}${hero('surprise', `<p class="big"><b>${gloss(r.conclusion)}</b></p>`)}
+    return `${topbar('相談の答え')}${log}${hero('surprise', `<p class="big"><b>${gloss(r.conclusion)}</b></p>`)}
     <div class="warn"><h3>気をつけてください</h3>${(r.explain || []).map((x) => `<p>${gloss(x)}</p>`).join('')}${rulesBox()}</div>
-    <div class="stack"><button class="btn primary" data-act="go" data-v="family">${icon('family')}家族に相談する</button><button class="btn" data-act="home">ホームにもどる</button></div>`;
+    <div class="stack"><button class="btn primary" data-act="go" data-v="family">${icon('family')}家族に相談する</button></div>${more}<div class="stack"><button class="btn" data-act="home">ホームにもどる</button></div>`;
   }
   if (r.kind === 'guide' && r.steps && r.steps.length) {
-    return `${topbar('相談の答え')}${hero('happy', `<p class="big"><b>${gloss(r.conclusion)}</b></p>${(r.explain || []).map((x) => `<p>${gloss(x)}</p>`).join('')}`)}
-    <div class="stack"><button class="btn primary" data-act="aiguide">一歩ずつ始める（${r.steps.length}ステップ）</button><button class="btn" data-act="askagain">ちがう相談をする</button></div>${local}
+    return `${topbar('相談の答え')}${log}${hero('happy', `<p class="big"><b>${gloss(r.conclusion)}</b></p>${(r.explain || []).map((x) => `<p>${gloss(x)}</p>`).join('')}`)}
+    <div class="stack"><button class="btn primary" data-act="aiguide">一歩ずつ始める（${r.steps.length}ステップ）</button></div>${local}${more}
+    <div class="stack"><button class="btn" data-act="askagain">ちがう相談をする</button></div>
     <p class="foot">相棒の答えは、まちがうこともあります。画面が違うときは「画面が違う」を押してください。</p>`;
   }
   if (r.kind === 'unknown') {
-    return `${topbar('相談の答え')}${hero('sorry', `<p class="big"><b>${gloss(r.conclusion || 'ごめんなさい。これは分かりませんでした。')}</b></p><p>ご家族か、お店で確認しましょう。</p>`)}
-    ${local}<div class="stack"><button class="btn primary" data-act="go" data-v="family">${icon('family')}家族に聞く</button><button class="btn" data-act="askagain">別の言い方で聞く</button></div>`;
+    return `${topbar('相談の答え')}${log}${hero('sorry', `<p class="big"><b>${gloss(r.conclusion || 'ごめんなさい。これは分かりませんでした。')}</b></p><p>ご家族か、お店で確認しましょう。</p>`)}
+    ${local}<div class="stack"><button class="btn primary" data-act="go" data-v="family">${icon('family')}家族に聞く</button></div>${more}<div class="stack"><button class="btn" data-act="askagain">別の言い方で聞く</button></div>`;
   }
-  return `${topbar('相談の答え')}${hero('happy', `<p class="big"><b>${gloss(r.conclusion)}</b></p>${(r.explain || []).map((x) => `<p>${gloss(x)}</p>`).join('')}`)}
-  ${local}<div class="stack"><button class="btn primary" data-act="home">わかった</button><button class="btn" data-act="askagain">もう一度聞く</button></div>`;
+  return `${topbar('相談の答え')}${log}${hero('happy', `<p class="big"><b>${gloss(r.conclusion)}</b></p>${(r.explain || []).map((x) => `<p>${gloss(x)}</p>`).join('')}`)}
+  ${local}${more}<div class="stack"><button class="btn primary" data-act="home">わかった</button><button class="btn" data-act="askagain">新しい相談をする</button></div>`;
+}
+/* 続けて聞く（ボタンを押すだけでも聞ける） */
+const FOLLOW_EXAMPLES = ['もっとくわしく教えて', 'できました', 'うまくいきません', '次はどうするの？'];
+function followBox() {
+  return `<h2 class="sec">続けて聞く</h2>
+  <div class="chips">${FOLLOW_EXAMPLES.map((e) => `<button class="chip" data-act="askfollow" data-v="${esc(e)}">${esc(e)}</button>`).join('')}</div>
+  <label class="lb" for="q">聞きたいこと</label>
+  <textarea class="inp" id="q" placeholder="例：そのボタンが見つかりません"></textarea>
+  <p class="hint">${icon('mic').replace('<svg', '<svg style="width:18px;height:18px;vertical-align:-3px"')} キーボードのマイクのマークを押すと、声で入力できます。</p>
+  <div class="stack"><button class="btn primary" data-act="asksend">送る</button></div>`;
 }
 function rulesBox() { return `<div class="rules"><div>押さない</div><div>払わない</div><div>家族に<br>相談</div></div>`; }
 
@@ -1488,10 +1556,29 @@ function rulesText() {
 - 支払い・契約・解約をこのアプリが代わりにすることはできない。操作は必ず本人が行う。
 安全:「電話をかけて」「今すぐ支払って」「ギフトカードで」など危険な表現があれば、最優先で kind を danger にし、押さない・払わない・家族に相談、を伝える。`;
 }
+/* 会話の相手に送る形（最初の相談＋そのあとのやりとり） */
+function chatTurns(p, q) {
+  const turns = [{ role: 'user', content: p.base }];
+  const chat = p.chat.length > 4 ? [p.chat[0], ...p.chat.slice(-3)] : p.chat; // 長くなりすぎないよう、最初と直近だけ
+  chat.forEach((c, i) => {
+    if (i > 0) turns.push({ role: 'user', content: `続けての相談:「${c.q.slice(0, 400)}」` });
+    turns.push({ role: 'assistant', content: JSON.stringify({ kind: c.res.kind, conclusion: c.res.conclusion, explain: c.res.explain, steps: (c.res.steps || []).map((s) => ({ t: s.t })) }) });
+  });
+  turns.push({ role: 'user', content: `続けての相談:「${q.slice(0, 400)}」
+これまでの会話の流れをふまえて、最初と同じ形のJSONだけを返してください。「できました」なら短くほめて、次にできることを伝える。「うまくいかない」「わからない」なら、別の言い方や確かめ方を伝える。` });
+  return turns;
+}
+function aiErrText(e) {
+  if (e && e.why === 'daily_limit') return '今日はたくさん相談しました。また明日どうぞ。';
+  if (e && e.why === 'quota') return '今日は相談がいっぱいになりました。また明日どうぞ。';
+  if (e && e.code === 'rate_limited') return '今は混み合っています。少し時間をおいてください。';
+  return 'ごめんなさい。うまく答えられませんでした。';
+}
 async function askAI(q) {
   const p = cur();
   const local = routeLocal(q);
   const score = scamScore(q);
+  const follow = !!(p.chat && p.chat.length && p.base);
   if (score >= 3 && !sampleFn) { replace('scamResult', { text: q, score }); return; }
   if (!sampleFn) {
     if (local) { p.res = { kind: 'answer', conclusion: 'この案内が合いそうです。下のボタンから始められます。', explain: [] }; p.local = local; }
@@ -1500,7 +1587,44 @@ async function askAI(q) {
   }
   p.busy = true; p.q = q; render();
   p.ctl = new AbortController();
-  const prompt = `あなたは、スマホが苦手な70歳前後の方を助けるアプリ「Buddies」の案内役「${C().full}」です。
+  if (follow) {
+    try {
+      const r = cleanAsk(await sampleFn.json(chatTurns(p, q), { signal: p.ctl.signal }), score);
+      p.chat.push({ q, res: r }); p.res = r; p.local = local || p.local; p.busy = false;
+      render(true);
+    } catch (e) {
+      p.busy = false;
+      if (!(e && e.code === 'cancelled')) toast(aiErrText(e));
+      render();
+    }
+    return;
+  }
+  p.base = basePrompt(q);
+  try {
+    const r = cleanAsk(await sampleFn.json(p.base, { signal: p.ctl.signal }), score);
+    p.chat = [{ q, res: r }];
+    p.res = r; p.local = local; p.busy = false;
+    logHist(r.title || q.slice(0, 20), { kind: 'ask', q });
+    render(true);
+  } catch (e) {
+    p.busy = false;
+    if (e && e.code === 'cancelled') { render(); return; }
+    if (e && (e.code === 'not_granted' || e.code === 'sampling_disabled' || e.code === 'not_declared')) sampleFn = null;
+    p.res = local ? { kind: 'answer', conclusion: '今は相棒に聞けませんでした。手元の案内を使いましょう。', explain: [] } : { kind: 'unknown', conclusion: aiErrText(e) };
+    p.local = local; render();
+  }
+}
+function cleanAsk(r, score) {
+  if (!r || typeof r !== 'object' || !r.conclusion) throw { code: 'invalid_json' };
+  r.conclusion = String(r.conclusion);
+  r.steps = Array.isArray(r.steps) ? r.steps.filter((x) => x && x.t).slice(0, 7).map((x) => ({ t: String(x.t), alt: String(x.alt || 'ゆっくりで大丈夫です。画面をよく見て探してみましょう。'), pos: ['top', 'mid', 'bot'].includes(x.pos) ? x.pos : 'mid', label: String(x.label || '') })) : [];
+  r.explain = Array.isArray(r.explain) ? r.explain.map(String).slice(0, 3) : [];
+  if (!['guide', 'answer', 'danger', 'unknown'].includes(r.kind)) r.kind = r.steps.length ? 'guide' : 'answer';
+  if (score >= 3 && r.kind !== 'danger') { r.kind = 'danger'; r.explain = ['あやしい言葉が入っています。', ...r.explain].slice(0, 3); }
+  return r;
+}
+function basePrompt(q) {
+  return `あなたは、スマホが苦手な70歳前後の方を助けるアプリ「Buddies」の案内役「${C().full}」です。
 利用者のスマホ: ${DEVICES[S.settings.device].name}
 ${rulesText()}
 
@@ -1517,22 +1641,6 @@ LINEの基本（メッセージ、写真を送る、電話、ビデオ通話で�
 - answer: 言葉の意味など、手順がいらないとき。steps は空配列。
 - danger: 詐欺やあやしい連絡の可能性があるとき。
 - unknown: 確かでないとき。`;
-  try {
-    const r = await sampleFn.json(prompt, { signal: p.ctl.signal });
-    if (!r || typeof r !== 'object' || !r.conclusion) throw { code: 'invalid_json' };
-    r.steps = Array.isArray(r.steps) ? r.steps.filter((x) => x && x.t).slice(0, 7).map((x) => ({ t: String(x.t), alt: String(x.alt || 'ゆっくりで大丈夫です。画面をよく見て探してみましょう。'), pos: ['top', 'mid', 'bot'].includes(x.pos) ? x.pos : 'mid', label: String(x.label || '') })) : [];
-    r.explain = Array.isArray(r.explain) ? r.explain.map(String).slice(0, 3) : [];
-    if (score >= 3 && r.kind !== 'danger') { r.kind = 'danger'; r.explain = ['あやしい言葉が入っています。', ...r.explain].slice(0, 3); }
-    p.res = r; p.local = local; p.busy = false;
-    logHist(r.title || q.slice(0, 20), { kind: 'ask', q });
-    render(true);
-  } catch (e) {
-    p.busy = false;
-    if (e && e.code === 'cancelled') { render(); return; }
-    if (e && (e.code === 'not_granted' || e.code === 'sampling_disabled' || e.code === 'not_declared')) sampleFn = null;
-    p.res = local ? { kind: 'answer', conclusion: '今は相棒に聞けませんでした。手元の案内を使いましょう。', explain: [] } : { kind: 'unknown', conclusion: e && e.code === 'rate_limited' ? '今は混み合っています。少し時間をおいてください。' : 'ごめんなさい。うまく答えられませんでした。' };
-    p.local = local; render();
-  }
 }
 function routeLocal(q) { for (const [re, k] of LOCAL_ROUTER) if (re.test(q)) return k; return null; }
 
@@ -1564,7 +1672,8 @@ function photoResult(p) {
   ${danger ? `<div class="warn"><h3>${r.danger >= 2 ? 'あやしい可能性が高いです' : '注意してください'}</h3><p>表示の中のボタンや文字は押さないでください。</p>${rulesBox()}</div>` : ''}
   ${r.next ? `<div class="card"><h3>次にすること</h3><p>${gloss(r.next)}</p></div>` : ''}
   <div class="stack">${danger ? `<button class="btn danger" data-act="topic" data-k="SCAM">あやしい連絡の対処を見る</button>` : ''}
-  <button class="btn primary" data-act="photonew">別の写真で聞く</button><button class="btn" data-act="home">ホームにもどる</button></div>
+  <button class="btn primary" data-act="photochat">この写真のことを続けて聞く</button>
+  <button class="btn" data-act="photonew">別の写真で聞く</button><button class="btn" data-act="home">ホームにもどる</button></div>
   <p class="foot">相棒の答えは、まちがうこともあります。心配なときは家族に確かめましょう。</p>`;
 }
 async function askPhoto(q) {
@@ -1594,7 +1703,7 @@ ${rulesText()}
     p.busy = false;
     if (!(e && e.code === 'cancelled')) {
       if (e && e.code === 'images_unavailable') imgOK = false;
-      toast(e && e.code === 'image_rejected' ? 'この写真は読めませんでした。別の写真にしてください' : 'うまく答えられませんでした。もう一度ためしてください');
+      toast(e && e.code === 'image_rejected' ? 'この写真は読めませんでした。別の写真にしてください' : e && e.code === 'rate_limited' ? aiErrText(e) : 'うまく答えられませんでした。もう一度ためしてください');
     }
     render();
   }
@@ -1870,6 +1979,7 @@ document.addEventListener('click', (e) => {
       if (!q.trim()) { toast('困っていることを書いてください'); break; }
       askAI(q.trim()); break;
     }
+    case 'askfollow': askAI(t.dataset.v); break;
     case 'askstop': if (c.ctl) c.ctl.abort(); break;
     case 'askagain': replace('ask', { q: '' }); break;
     case 'reask': { const h = S.history[+t.dataset.i]; go('ask', { q: h.q }); break; }
@@ -1882,6 +1992,13 @@ document.addEventListener('click', (e) => {
     case 'photosend': askPhoto(((document.getElementById('pq') || {}).value || '').trim()); break;
     case 'photostop': if (c.ctl) c.ctl.abort(); break;
     case 'photonew': clearPhoto(); replace('photo', {}); break;
+    case 'photochat': {
+      // 写真の答えを最初のやりとりにして、文字で続けて相談する（写真そのものは送り直さない）
+      const r = c.res, q = '（写真を見せて）' + (c.q || 'これは何？');
+      const res = { kind: r.danger >= 2 ? 'danger' : 'answer', conclusion: String(r.what || ''), explain: [...(r.explain || []), ...(r.next ? [String(r.next)] : [])].slice(0, 3), steps: [] };
+      go('ask', { base: basePrompt(q + `\n（写真に写っていたもの：${res.conclusion}。${res.explain.join('')}）`), chat: [{ q, res }], res });
+      break;
+    }
     /* あやしい連絡 */
     case 'scampre': logHist('あやしい連絡：' + SCAM_PRESETS.find((x) => x.id === t.dataset.id).label, { kind: 'scam' }); go('scamResult', { preset: t.dataset.id }); break;
     case 'scamcheck': {

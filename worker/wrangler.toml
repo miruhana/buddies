@@ -1,0 +1,14 @@
+name = "buddies-ai"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+[ai]
+binding = "AI"
+
+[vars]
+ALLOWED_ORIGINS = "https://miruhana.github.io"
+
+# 1日の利用回数を数える入れ物（初回の公開時に作成してIDを入れます）
+[[kv_namespaces]]
+binding = "RL"
+id = "9ec57038f0ca4ee6bcfde9a03991d20c"
